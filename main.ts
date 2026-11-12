@@ -1,599 +1,492 @@
 // main.ts — model-free photo geolocator for make.fun photo-geolocator-01.
 //
-// No model, no API key, no network beyond the trial env. For each of the
-// instance's 25 street-level photos it decodes the JPEG itself (baseline
-// JPEG decoder, standard library only), reads simple visual cues from the
-// pixels — sky, vegetation, desert sand, snow, water, road, building
-// density — and maps them to a region guess. Every photo is answered; a
-// photo whose JPEG cannot be decoded falls back to the dataset's median
-// point, which still beats leaving it unanswered (20,015 km).
+// Node standard library only. No model calls, no API keys, no wall clock,
+// no randomness. A hand-written baseline JPEG decoder feeds a small feature
+// extractor; the guess is a fixed point (57.5, 27.5), with an arid override
+// (-13.75, -29.5) when the lower part of the frame is mostly sand and
+// there is almost no vegetation. Pixel cues do not separate regions
+// reliably, so a smarter classifier scores worse than the fixed point.
 //
-// Deterministic: every request is a function of the photo bytes and the
-// fixed rules below; photos are processed in id order and answers are
-// posted in photo order, so a replay leaves the same answers. No wall
-// clock, no unseeded randomness.
-//
-// Run as the grader runs it: `node /bot/main.ts` on Node 22, with
-// MAKEFUN_ENV_URL (the env) and MAKEFUN_PROMPT_FILE set. Reads the brief
-// for the record and exits 0 once the answers are posted.
+// Env: MAKEFUN_PROMPT_FILE (advisory), MAKEFUN_ENV_URL (base URL).
+// GET /photos, GET /photos/<id>.jpg, POST /answers.
 
-export interface DecodedImage {
+import { readFileSync } from "node:fs";
+
+const FIXED = { lat: 57.5, lon: 27.5 };
+const ARID = { lat: -13.75, lon: -29.5 };
+
+interface Image {
   width: number;
   height: number;
-  /** RGB bytes, row-major, width * height * 3. */
-  data: Uint8Array;
+  data: Uint8Array; // RGB
 }
 
 // ---------------------------------------------------------------------------
-// Baseline JPEG decoder (8-bit, Huffman, 1 or 3 components).
+// Baseline JPEG decoder
 // ---------------------------------------------------------------------------
 
 const ZIGZAG = [
-  0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33,
-  40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50,
-  43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39,
-  46, 53, 60, 61, 54, 47, 55, 62, 63,
+  0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40,
+  48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36,
+  29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61,
+  54, 47, 55, 62, 63,
 ];
 
-type HuffMap = Map<number, number>[];
+interface Huff {
+  // canonical decode tables indexed by code length 1..16
+  mincode: Int32Array;
+  maxcode: Int32Array;
+  valptr: Int32Array;
+  vals: Uint8Array;
+}
 
-function buildHuff(counts: number[], symbols: number[]): HuffMap {
-  const maps: HuffMap = Array.from({ length: 17 }, () => new Map());
+function buildHuff(counts: number[], vals: Uint8Array): Huff {
+  const mincode = new Int32Array(17);
+  const maxcode = new Int32Array(17).fill(-1);
+  const valptr = new Int32Array(17);
   let code = 0;
   let k = 0;
-  for (let len = 1; len <= 16; len++) {
-    for (let i = 0; i < counts[len - 1]; i++) {
-      maps[len].set(code, symbols[k]);
-      k += 1;
-      code += 1;
-    }
+  for (let l = 1; l <= 16; l++) {
+    valptr[l] = k;
+    mincode[l] = code;
+    code += counts[l - 1];
+    k += counts[l - 1];
+    maxcode[l] = counts[l - 1] ? code - 1 : -1;
     code <<= 1;
   }
-  return maps;
+  return { mincode, maxcode, valptr, vals };
 }
 
-class BitReader {
-  private data: Buffer;
-  private pos: number;
-  private bitBuf = 0;
-  private bitCnt = 0;
-  constructor(data: Buffer, start: number) {
-    this.data = data;
-    this.pos = start;
-  }
-  /** Next data byte, honouring 0xFF00 stuffing; -1 at a real marker (rewound). */
-  private nextByte(): number {
-    if (this.pos >= this.data.length) return -1;
-    const b = this.data[this.pos];
-    this.pos += 1;
-    if (b === 0xff) {
-      const b2 = this.data[this.pos];
-      if (b2 === 0x00) {
-        this.pos += 1;
-        return 0xff;
-      }
-      this.pos -= 1;
-      return -1;
-    }
-    return b;
-  }
-  bit(): number {
-    if (this.bitCnt === 0) {
-      const b = this.nextByte();
-      if (b < 0) {
-        this.bitBuf = 0;
-        this.bitCnt = 1;
-        return 0;
-      }
-      this.bitBuf = b;
-      this.bitCnt = 8;
-    }
-    this.bitCnt -= 1;
-    return (this.bitBuf >> this.bitCnt) & 1;
-  }
-  bits(n: number): number {
-    let v = 0;
-    for (let i = 0; i < n; i++) v = (v << 1) | this.bit();
-    return v;
-  }
-  /** Drop to the next byte boundary (after a restart marker). */
-  align(): void {
-    this.bitCnt = 0;
-  }
-  /** Byte offset of the next unread byte (after aligning). */
-  bytePos(): number {
-    return this.pos;
-  }
-}
-
-function huffSymbol(br: BitReader, table: HuffMap): number {
-  let code = 0;
-  for (let len = 1; len <= 16; len++) {
-    code = (code << 1) | br.bit();
-    const s = table[len].get(code);
-    if (s !== undefined) return s;
-  }
-  throw new Error('bad huffman code');
-}
-
-function extend(br: BitReader, n: number): number {
-  if (n === 0) return 0;
-  const v = br.bits(n);
-  if (v < 1 << (n - 1)) return v - (1 << n) + 1;
-  return v;
-}
-
-// Precomputed cosines for the 8x8 inverse DCT.
-const COS: number[][] = Array.from({ length: 8 }, (_, u) =>
-  Array.from({ length: 8 }, (_, x) => Math.cos(((2 * x + 1) * u * Math.PI) / 16)),
-);
-const CU: number[] = Array.from({ length: 8 }, (_, u) => (u === 0 ? 1 / Math.SQRT2 : 1));
-
-/** 64 dequantised coefficients -> 64 spatial samples (row-major). */
-function idctBlock(coef: Float64Array, out: Float64Array): void {
-  const tmp = new Float64Array(64);
-  for (let y = 0; y < 8; y++) {
-    for (let x = 0; x < 8; x++) {
-      let s = 0;
-      for (let u = 0; u < 8; u++) s += CU[u] * coef[y * 8 + u] * COS[u][x];
-      tmp[y * 8 + x] = s;
-    }
-  }
-  for (let y = 0; y < 8; y++) {
-    for (let x = 0; x < 8; x++) {
-      let s = 0;
-      for (let v = 0; v < 8; v++) s += CU[v] * tmp[v * 8 + x] * COS[v][y];
-      out[y * 8 + x] = 0.25 * s;
-    }
-  }
-}
-
-interface JpegComponent {
+interface Comp {
   id: number;
   h: number;
   v: number;
   tq: number;
-  /** Sampled-resolution plane, filled by the scan. */
-  plane: Float64Array;
-  pw: number;
-  ph: number;
+  dc: number;
+  ac: number;
+  pred: number;
+  bw: number; // blocks per line (padded to MCU)
+  bh: number;
+  coef: Float32Array; // decoded samples (padded plane), stride bw*8
+  w: number; // true sampled width
+  h8: number; // true sampled height
 }
 
-export function decodeJpeg(buf: Buffer, stride = 4): DecodedImage {
-  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) {
-    throw new Error('not a JPEG (no SOI)');
+function idct8(block: Float32Array, out: Float32Array): void {
+  // separable float IDCT with precomputed cosine table
+  const tmp = new Float32Array(64);
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      let s = 0;
+      for (let u = 0; u < 8; u++) s += COS[x * 8 + u] * block[y * 8 + u];
+      tmp[y * 8 + x] = s;
+    }
   }
-  const quant: Float64Array[] = [];
-  const dcTables: HuffMap[] = [];
-  const acTables: HuffMap[] = [];
+  for (let x = 0; x < 8; x++) {
+    for (let y = 0; y < 8; y++) {
+      let s = 0;
+      for (let v = 0; v < 8; v++) s += COS[y * 8 + v] * tmp[v * 8 + x];
+      out[y * 8 + x] = s;
+    }
+  }
+}
+const COS = new Float32Array(64);
+for (let x = 0; x < 8; x++)
+  for (let u = 0; u < 8; u++)
+    COS[x * 8 + u] =
+      (u === 0 ? Math.SQRT1_2 : 1) * 0.5 * Math.cos(((2 * x + 1) * u * Math.PI) / 16);
+
+function decodeJpeg(buf: Uint8Array): Image {
+  let pos = 0;
+  const u16 = () => ((buf[pos] << 8) | buf[pos + 1]);
+  if (buf[0] !== 0xff || buf[1] !== 0xd8) throw new Error("not a JPEG");
+  pos = 2;
+  const qt: Int32Array[] = [];
+  const dcT: Huff[] = [];
+  const acT: Huff[] = [];
+  let comps: Comp[] = [];
   let width = 0;
   let height = 0;
-  let components: JpegComponent[] = [];
-  let restartInterval = 0;
-  let scanStart = -1;
-  let scanComps: { comp: JpegComponent; dc: HuffMap; ac: HuffMap }[] = [];
+  let hmax = 1;
+  let vmax = 1;
+  let ri = 0;
+  let sawScan = false;
 
-  let p = 2;
-  const segLen = (): number => (buf[p + 2] << 8) | buf[p + 3];
-  while (p < buf.length - 1) {
-    if (buf[p] !== 0xff) throw new Error(`bad marker at ${p}`);
-    const m = buf[p + 1];
-    if (m === 0xd9) break; // EOI
-    if (m === 0xda) {
-      // SOS: parse the scan header, then decode.
-      const n = buf[p + 4];
-      let q = p + 5;
-      scanComps = [];
-      for (let i = 0; i < n; i++) {
-        const id = buf[q];
-        const comp = components.find((c) => c.id === id);
-        if (!comp) throw new Error('SOS references unknown component');
-        const td = buf[q + 1] >> 4;
-        const ta = buf[q + 1] & 0x0f;
-        if (!dcTables[td] || !acTables[ta]) throw new Error('SOS references unknown Huffman table');
-        scanComps.push({ comp, dc: dcTables[td], ac: acTables[ta] });
-        q += 2;
-      }
-      scanStart = q + 3; // skip Ss, Se, Ah/Al
-      break;
-    }
-    if (m === 0xdb) {
-      // DQT
-      const end = p + 2 + segLen();
-      let q = p + 4;
-      while (q < end) {
-        const pq = buf[q] >> 4;
-        const tq = buf[q] & 0x0f;
-        q += 1;
-        const table = new Float64Array(64);
-        if (pq === 0) {
-          for (let i = 0; i < 64; i++) table[ZIGZAG[i]] = buf[q + i];
-          q += 64;
-        } else {
-          for (let i = 0; i < 64; i++) table[ZIGZAG[i]] = (buf[q + 2 * i] << 8) | buf[q + 2 * i + 1];
-          q += 128;
-        }
-        quant[tq] = table;
-      }
-      p = end;
+  while (pos < buf.length && !sawScan) {
+    if (buf[pos] !== 0xff) {
+      pos++;
       continue;
     }
-    if (m === 0xc0) {
-      // SOF0 (baseline). SOF2 (progressive) is not supported.
-      height = (buf[p + 5] << 8) | buf[p + 6];
-      width = (buf[p + 7] << 8) | buf[p + 8];
-      const n = buf[p + 9];
-      components = [];
+    while (buf[pos] === 0xff) pos++;
+    const m = buf[pos++];
+    if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7) || m === 0) continue;
+    if (m === 0xd9) break;
+    const len = u16();
+    const end = pos + len;
+    const seg = pos + 2;
+    if (m === 0xdb) {
+      let p = seg;
+      while (p < end) {
+        const pq = buf[p] >> 4;
+        const tq = buf[p] & 15;
+        p++;
+        const t = new Int32Array(64);
+        for (let i = 0; i < 64; i++) {
+          if (pq) {
+            t[ZIGZAG[i]] = (buf[p] << 8) | buf[p + 1];
+            p += 2;
+          } else t[ZIGZAG[i]] = buf[p++];
+        }
+        qt[tq] = t;
+      }
+    } else if (m === 0xc0 || m === 0xc1) {
+      height = (buf[seg + 1] << 8) | buf[seg + 2];
+      width = (buf[seg + 3] << 8) | buf[seg + 4];
+      const n = buf[seg + 5];
+      comps = [];
       for (let i = 0; i < n; i++) {
-        const q = p + 10 + 3 * i;
-        components.push({
-          id: buf[q],
-          h: buf[q + 1] >> 4,
-          v: buf[q + 1] & 0x0f,
-          tq: buf[q + 2],
-          plane: new Float64Array(0),
-          pw: 0,
-          ph: 0,
+        const o = seg + 6 + i * 3;
+        comps.push({
+          id: buf[o], h: buf[o + 1] >> 4, v: buf[o + 1] & 15, tq: buf[o + 2],
+          dc: 0, ac: 0, pred: 0, bw: 0, bh: 0, coef: new Float32Array(0), w: 0, h8: 0,
         });
       }
-      p += 2 + segLen();
-      continue;
-    }
-    if (m === 0xc2) throw new Error('progressive JPEG not supported');
-    if (m === 0xc4) {
-      // DHT
-      const end = p + 2 + segLen();
-      let q = p + 4;
-      while (q < end) {
-        const tc = buf[q] >> 4;
-        const th = buf[q] & 0x0f;
-        const counts = Array.from({ length: 16 }, (_, i) => buf[q + 1 + i]);
-        const total = counts.reduce((a, b) => a + b, 0);
-        const symbols = Array.from({ length: total }, (_, i) => buf[q + 17 + i]);
-        const table = buildHuff(counts, symbols);
-        if (tc === 0) dcTables[th] = table;
-        else acTables[th] = table;
-        q += 17 + total;
-      }
-      p = end;
-      continue;
-    }
-    if (m === 0xdd) {
-      restartInterval = (buf[p + 4] << 8) | buf[p + 5];
-      p += 2 + segLen();
-      continue;
-    }
-    if (m === 0x01 || (m >= 0xd0 && m <= 0xd8)) {
-      p += 2;
-      continue;
-    }
-    p += 2 + segLen();
-  }
-  if (!width || !height || components.length === 0 || scanStart < 0) {
-    throw new Error('incomplete JPEG headers');
-  }
-
-  const hMax = Math.max(...components.map((c) => c.h));
-  const vMax = Math.max(...components.map((c) => c.v));
-  for (const c of components) {
-    c.pw = Math.ceil((width * c.h) / hMax / 8) * 8;
-    c.ph = Math.ceil((height * c.v) / vMax / 8) * 8;
-    c.plane = new Float64Array(c.pw * c.ph);
-  }
-  const mcusX = Math.ceil(width / (8 * hMax));
-  const mcusY = Math.ceil(height / (8 * vMax));
-
-  const br = new BitReader(buf, scanStart);
-  const dcPred = new Array<number>(components.length).fill(0);
-  const coef = new Float64Array(64);
-  const spatial = new Float64Array(64);
-  let mcuCount = 0;
-  let restartsSeen = 0;
-
-  for (let my = 0; my < mcusY; my++) {
-    for (let mx = 0; mx < mcusX; mx++) {
-      if (restartInterval > 0 && mcuCount > 0 && mcuCount % restartInterval === 0) {
-        br.align();
-        const pos = br.bytePos();
-        if (buf[pos] !== 0xff || buf[pos + 1] !== 0xd0 + (restartsSeen % 8)) {
-          throw new Error('missing restart marker');
+      hmax = Math.max(...comps.map((c) => c.h));
+      vmax = Math.max(...comps.map((c) => c.v));
+    } else if (m === 0xc2 || (m >= 0xc3 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc)) {
+      throw new Error("unsupported (non-baseline) JPEG");
+    } else if (m === 0xc4) {
+      let p = seg;
+      while (p < end) {
+        const tc = buf[p] >> 4;
+        const th = buf[p] & 15;
+        p++;
+        const counts: number[] = [];
+        let total = 0;
+        for (let i = 0; i < 16; i++) {
+          counts.push(buf[p + i]);
+          total += buf[p + i];
         }
-        br.bytePos(); // marker consumed by re-seeking below
-        restartsSeen += 1;
-        for (let i = 0; i < dcPred.length; i++) dcPred[i] = 0;
-        // Rebuild the reader past the marker.
-        (br as { pos: number }).pos = pos + 2;
+        p += 16;
+        const h = buildHuff(counts, buf.slice(p, p + total));
+        p += total;
+        (tc === 0 ? dcT : acT)[th] = h;
       }
-      for (const { comp, dc, ac } of scanComps) {
-        const ci = components.indexOf(comp);
-        for (let by = 0; by < comp.v; by++) {
-          for (let bx = 0; bx < comp.h; bx++) {
-            coef.fill(0);
-            const t = huffSymbol(br, dc);
-            const diff = extend(br, t);
-            dcPred[ci] += diff;
-            coef[0] = dcPred[ci] * quant[comp.tq][0];
-            let k = 1;
-            while (k < 64) {
-              const s = huffSymbol(br, ac);
-              const run = s >> 4;
-              const size = s & 0x0f;
-              if (size === 0) {
-                if (run === 0x0f) k += 16;
-                else break; // EOB
-              } else {
-                k += run;
-                if (k >= 64) break;
-                coef[ZIGZAG[k]] = extend(br, size) * quant[comp.tq][ZIGZAG[k]];
-                k += 1;
-              }
+    } else if (m === 0xdd) {
+      ri = (buf[seg] << 8) | buf[seg + 1];
+    } else if (m === 0xda) {
+      const n = buf[seg];
+      const scanComps: Comp[] = [];
+      for (let i = 0; i < n; i++) {
+        const cid = buf[seg + 1 + i * 2];
+        const t = buf[seg + 2 + i * 2];
+        const c = comps.find((x) => x.id === cid);
+        if (!c) throw new Error("bad scan component");
+        c.dc = t >> 4;
+        c.ac = t & 15;
+        scanComps.push(c);
+      }
+      pos = end;
+      decodeScan(scanComps);
+      sawScan = true;
+      continue;
+    }
+    pos = end;
+  }
+  if (!sawScan || !width || !height) throw new Error("no image data");
+
+  function decodeScan(sc: Comp[]): void {
+    const mcux = Math.ceil(width / (8 * hmax));
+    const mcuy = Math.ceil(height / (8 * vmax));
+    for (const c of comps) {
+      c.bw = mcux * c.h;
+      c.bh = mcuy * c.v;
+      c.coef = new Float32Array(c.bw * 8 * c.bh * 8);
+      c.w = Math.ceil((width * c.h) / hmax);
+      c.h8 = Math.ceil((height * c.v) / vmax);
+    }
+    // bit reader (handles 0xFF00 stuffing, stops at markers)
+    let bitBuf = 0;
+    let bitCnt = 0;
+    let hitMarker = false;
+    const readBit = (): number => {
+      if (bitCnt === 0) {
+        let b = 0;
+        if (!hitMarker && pos < buf.length) {
+          b = buf[pos];
+          if (b === 0xff) {
+            const n = buf[pos + 1];
+            if (n === 0) pos += 2;
+            else {
+              hitMarker = true;
+              b = 0;
             }
-            idctBlock(coef, spatial);
-            const ox = (mx * comp.h + bx) * 8;
-            const oy = (my * comp.v + by) * 8;
-            for (let y = 0; y < 8; y++) {
-              for (let x = 0; x < 8; x++) {
-                comp.plane[(oy + y) * comp.pw + ox + x] = spatial[y * 8 + x] + 128;
-              }
-            }
+          } else pos++;
+        }
+        bitBuf = b;
+        bitCnt = 8;
+      }
+      bitCnt--;
+      return (bitBuf >> bitCnt) & 1;
+    };
+    const receive = (n: number): number => {
+      let v = 0;
+      for (let i = 0; i < n; i++) v = (v << 1) | readBit();
+      return v;
+    };
+    const extend = (v: number, n: number): number => (n === 0 ? 0 : v < 1 << (n - 1) ? v - (1 << n) + 1 : v);
+    const decodeSym = (h: Huff): number => {
+      let code = 0;
+      for (let l = 1; l <= 16; l++) {
+        code = (code << 1) | readBit();
+        if (h.maxcode[l] >= 0 && code <= h.maxcode[l] && code >= h.mincode[l])
+          return h.vals[h.valptr[l] + code - h.mincode[l]];
+      }
+      throw new Error("bad huffman code");
+    };
+
+    const blk = new Float32Array(64);
+    const px = new Float32Array(64);
+    const decodeBlock = (c: Comp, bx: number, by: number): void => {
+      blk.fill(0);
+      const q = qt[c.tq];
+      const dcH = dcT[c.dc];
+      const acH = acT[c.ac];
+      if (!q || !dcH || !acH) throw new Error("missing table");
+      const t = decodeSym(dcH);
+      c.pred += extend(receive(t), t);
+      blk[0] = c.pred * q[0];
+      for (let k = 1; k < 64; ) {
+        const rs = decodeSym(acH);
+        const s = rs & 15;
+        const r = rs >> 4;
+        if (s === 0) {
+          if (r === 15) {
+            k += 16;
+            continue;
           }
+          break;
         }
+        k += r;
+        if (k > 63) break;
+        const z = ZIGZAG[k];
+        blk[z] = extend(receive(s), s) * q[z];
+        k++;
       }
-      mcuCount += 1;
+      idct8(blk, px);
+      const stride = c.bw * 8;
+      for (let y = 0; y < 8; y++) {
+        const o = (by * 8 + y) * stride + bx * 8;
+        for (let x = 0; x < 8; x++) c.coef[o + x] = px[y * 8 + x] + 128;
+      }
+    };
+
+    const reset = () => {
+      bitCnt = 0;
+      hitMarker = false;
+      // skip to after RSTn marker
+      while (pos + 1 < buf.length && !(buf[pos] === 0xff && buf[pos + 1] >= 0xd0 && buf[pos + 1] <= 0xd7)) {
+        if (buf[pos] === 0xff && buf[pos + 1] === 0xd9) return;
+        pos++;
+      }
+      pos += 2;
+      for (const c of comps) c.pred = 0;
+    };
+
+    let count = 0;
+    const single = sc.length === 1;
+    if (single) {
+      const c = sc[0];
+      const bwTrue = Math.ceil(c.w / 8);
+      const bhTrue = Math.ceil(c.h8 / 8);
+      for (let by = 0; by < bhTrue; by++)
+        for (let bx = 0; bx < bwTrue; bx++) {
+          if (ri && count > 0 && count % ri === 0) reset();
+          decodeBlock(c, bx, by);
+          count++;
+        }
+    } else {
+      for (let my = 0; my < mcuy; my++)
+        for (let mx = 0; mx < mcux; mx++) {
+          if (ri && count > 0 && count % ri === 0) reset();
+          for (const c of sc)
+            for (let v = 0; v < c.v; v++)
+              for (let h = 0; h < c.h; h++) decodeBlock(c, mx * c.h + h, my * c.v + v);
+          count++;
+        }
     }
   }
 
-  // Convert to RGB at 1/stride resolution (nearest sampling).
-  const ow = Math.max(1, Math.ceil(width / stride));
-  const oh = Math.max(1, Math.ceil(height / stride));
-  const out = new Uint8Array(ow * oh * 3);
-  const sample = (c: JpegComponent, x: number, y: number): number => {
-    // Plane coordinates follow the sampling ratios, not the padded plane
-    // width: the plane's first `width` columns map 1:1 to image columns
-    // for a full-resolution component; the extra columns are MCU padding.
-    const sx = Math.min(c.pw - 1, Math.floor((x * c.h) / hMax));
-    const sy = Math.min(c.ph - 1, Math.floor((y * c.v) / vMax));
-    return c.plane[sy * c.pw + sx];
+  // assemble RGB, upsampling each plane by its own sampled dimensions
+  const out = new Uint8Array(width * height * 3);
+  const planeAt = (c: Comp, x: number, y: number): number => {
+    let sx = Math.floor((x * c.h) / hmax);
+    let sy = Math.floor((y * c.v) / vmax);
+    if (sx >= c.w) sx = c.w - 1;
+    if (sy >= c.h8) sy = c.h8 - 1;
+    return c.coef[sy * c.bw * 8 + sx];
   };
-  const clamp = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : v);
-  for (let y = 0; y < oh; y++) {
-    for (let x = 0; x < ow; x++) {
-      const fx = x * stride;
-      const fy = y * stride;
-      const o = (y * ow + x) * 3;
-      if (components.length === 1) {
-        const g = clamp(sample(components[0], fx, fy));
-        out[o] = g;
-        out[o + 1] = g;
-        out[o + 2] = g;
+  const clamp = (v: number) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const o = (y * width + x) * 3;
+      if (comps.length === 1) {
+        const l = clamp(planeAt(comps[0], x, y));
+        out[o] = out[o + 1] = out[o + 2] = l;
       } else {
-        const yy = sample(components[0], fx, fy);
-        const cb = sample(components[1], fx, fy) - 128;
-        const cr = sample(components[2], fx, fy) - 128;
-        out[o] = clamp(yy + 1.402 * cr);
-        out[o + 1] = clamp(yy - 0.34414 * cb - 0.71414 * cr);
-        out[o + 2] = clamp(yy + 1.772 * cb);
+        const Y = planeAt(comps[0], x, y);
+        const cb = planeAt(comps[1], x, y) - 128;
+        const cr = planeAt(comps[2], x, y) - 128;
+        out[o] = clamp(Y + 1.402 * cr);
+        out[o + 1] = clamp(Y - 0.344136 * cb - 0.714136 * cr);
+        out[o + 2] = clamp(Y + 1.772 * cb);
       }
     }
   }
-  return { width: ow, height: oh, data: out };
+  return { width, height, data: out };
 }
 
 // ---------------------------------------------------------------------------
-// Visual features: simple, robust cues computed from the decoded pixels.
-// All fractions are 0..1; all means are in 0..255 unless noted.
+// Feature extraction
 // ---------------------------------------------------------------------------
 
-export interface Features {
+interface Features {
+  skyBlue: number;
+  skyGray: number;
+  veg: number;
+  vegBright: number;
+  vegDark: number;
+  sand: number;
+  redDirt: number;
+  snow: number;
+  water: number;
+  road: number;
+  yellow: number;
+  edge: number;
+  warm: number;
   bright: number;
   sat: number;
-  warm: number; // mean (R - B): warm/desert light vs cool northern light
-  green: number; // mean (G - R)
-  skyBlue: number; // blue-dominant pixels in the top 35% of rows
-  skyGray: number; // overcast-gray pixels in the top 35% of rows
-  veg: number; // green-dominant pixels anywhere
-  vegBright: number; // bright green (tropical broadleaf)
-  vegDark: number; // dark green (boreal/conifer)
-  sand: number; // tan/brown dry ground
-  redDirt: number; // red-brown soil
-  snow: number; // near-white, low-saturation (anywhere)
-  snowGround: number; // near-white, low-saturation in the bottom 60% of rows
-  vegGround: number; // green-dominant pixels in the bottom 60% of rows
-  sandGround: number; // tan/brown dry ground in the bottom 60% of rows
-  water: number; // blue pixels in the bottom 60% of rows
-  road: number; // gray mid-tone pixels in the bottom 60%
-  yellow: number; // yellow road-marking pixels in the bottom 60%
-  edge: number; // mean luma gradient magnitude (urban/building density)
+  green: number;
+  snowGround: number;
+  vegGround: number;
+  sandGround: number;
 }
 
-export function extractFeatures(img: DecodedImage): Features {
-  const { width: w, height: h, data } = img;
-  const n = w * h;
-  let bright = 0;
-  let sat = 0;
-  let warm = 0;
-  let green = 0;
-  let skyBlue = 0;
-  let skyGray = 0;
-  let veg = 0;
-  let vegBright = 0;
-  let vegDark = 0;
-  let sand = 0;
-  let redDirt = 0;
-  let snow = 0;
-  let snowGround = 0;
-  let vegGround = 0;
-  let sandGround = 0;
-  let water = 0;
-  let road = 0;
-  let yellow = 0;
-  let skyN = 0;
-  let groundN = 0;
-  const luma = new Float64Array(n);
+function extract(img: Image): Features {
+  const { width: w, height: h, data: d } = img;
+  const skyRows = Math.floor(h * 0.35);
+  const groundStart = Math.floor(h * 0.4);
+  const f: Record<string, number> = {};
+  const keys = ["skyBlue", "skyGray", "veg", "vegBright", "vegDark", "sand", "redDirt", "snow", "water", "road", "yellow", "edge", "warm", "bright", "sat", "green", "snowGround", "vegGround", "sandGround"];
+  for (const k of keys) f[k] = 0;
+  let nGround = 0;
   for (let y = 0; y < h; y++) {
-    const top = y < h * 0.35;
-    const ground = y >= h * 0.4;
     for (let x = 0; x < w; x++) {
       const o = (y * w + x) * 3;
-      const r = data[o];
-      const g = data[o + 1];
-      const b = data[o + 2];
-      const mx = Math.max(r, g, b);
-      const mn = Math.min(r, g, b);
+      const r = d[o], g = d[o + 1], b = d[o + 2];
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+      const s = mx === 0 ? 0 : (mx - mn) / mx;
       const l = 0.299 * r + 0.587 * g + 0.114 * b;
-      luma[y * w + x] = l;
-      bright += l;
-      sat += mx - mn;
-      warm += r - b;
-      green += g - r;
-      if (top) {
-        skyN += 1;
-        if (b > r + 15 && b > g + 5 && b > 90) skyBlue += 1;
-        else if (mx - mn < 18 && l > 110 && l < 210) skyGray += 1;
+      const isVeg = g > r + 6 && g > b + 10;
+      const isSand = r > 140 && r >= g && g >= b && r - b > 25 && r - b < 110 && s < 0.5;
+      const isSnow = mx > 200 && s < 0.1;
+      f.veg += isVeg ? 1 : 0;
+      f.vegBright += isVeg && l > 120 ? 1 : 0;
+      f.vegDark += isVeg && l <= 70 ? 1 : 0;
+      f.sand += isSand ? 1 : 0;
+      f.redDirt += r > 120 && r > g + 30 && g > b && s > 0.4 ? 1 : 0;
+      f.snow += isSnow ? 1 : 0;
+      f.water += b > r + 20 && b >= g && y >= skyRows ? 1 : 0;
+      f.road += s < 0.12 && l > 60 && l < 150 ? 1 : 0;
+      f.yellow += r > 180 && g > 150 && b < 100 ? 1 : 0;
+      f.warm += r - b;
+      f.bright += l;
+      f.sat += s;
+      f.green += g;
+      if (x + 1 < w && y + 1 < h) {
+        const o2 = o + 3, o3 = o + w * 3;
+        const l2 = 0.299 * d[o2] + 0.587 * d[o2 + 1] + 0.114 * d[o2 + 2];
+        const l3 = 0.299 * d[o3] + 0.587 * d[o3 + 1] + 0.114 * d[o3 + 2];
+        f.edge += Math.abs(l - l2) + Math.abs(l - l3) > 40 ? 1 : 0;
       }
-      const isGreen = g > r + 8 && g > b + 4;
-      if (isGreen) {
-        veg += 1;
-        if (l > 110) vegBright += 1;
-        else if (l < 80) vegDark += 1;
+      if (y < skyRows) {
+        f.skyBlue += b > r + 15 && b > 130 ? 1 : 0;
+        f.skyGray += s < 0.12 && l > 130 ? 1 : 0;
       }
-      if (r > 120 && g > 80 && r > b + 25 && g > b + 10 && !isGreen) sand += 1;
-      if (r > 90 && r > g + 25 && r > b + 40) redDirt += 1;
-      if (mx > 200 && mx - mn < 22) snow += 1;
-      if (ground) {
-        groundN += 1;
-        if (mx > 200 && mx - mn < 22) snowGround += 1;
-        if (isGreen) vegGround += 1;
-        if (r > 120 && g > 80 && r > b + 25 && g > b + 10 && !isGreen) sandGround += 1;
-        if (b > r + 25 && b > 80) water += 1;
-        if (mx - mn < 18 && l > 55 && l < 175) road += 1;
-        if (r > 150 && g > 110 && b < 100 && r > b + 60 && g > b + 40) yellow += 1;
+      if (y >= groundStart) {
+        f.snowGround += isSnow ? 1 : 0;
+        f.vegGround += isVeg ? 1 : 0;
+        f.sandGround += isSand ? 1 : 0;
       }
     }
   }
-  let edge = 0;
-  let edgeN = 0;
-  for (let y = 1; y < h; y++) {
-    for (let x = 1; x < w; x++) {
-      const i = y * w + x;
-      edge += Math.abs(luma[i] - luma[i - 1]) + Math.abs(luma[i] - luma[i - w]);
-      edgeN += 1;
-    }
-  }
-  return {
-    bright: bright / n,
-    sat: sat / n,
-    warm: warm / n,
-    green: green / n,
-    skyBlue: skyN ? skyBlue / skyN : 0,
-    skyGray: skyN ? skyGray / skyN : 0,
-    veg: veg / n,
-    vegBright: vegBright / n,
-    vegDark: vegDark / n,
-    sand: sand / n,
-    redDirt: redDirt / n,
-    snow: snow / n,
-    snowGround: groundN ? snowGround / groundN : 0,
-    vegGround: groundN ? vegGround / groundN : 0,
-    sandGround: groundN ? sandGround / groundN : 0,
-    water: groundN ? water / groundN : 0,
-    road: groundN ? road / groundN : 0,
-    yellow: groundN ? yellow / groundN : 0,
-    edge: edgeN ? edge / edgeN : 0,
-  };
+  nGround = (h - groundStart) * w;
+  const n = w * h;
+  const sn = Math.max(1, skyRows * w);
+  for (const k of ["veg", "vegBright", "vegDark", "sand", "redDirt", "snow", "water", "road", "yellow", "edge"]) f[k] /= n;
+  f.warm /= n * 255;
+  f.bright /= n * 255;
+  f.sat /= n;
+  f.green /= n * 255;
+  f.skyBlue /= sn;
+  f.skyGray /= sn;
+  for (const k of ["snowGround", "vegGround", "sandGround"]) f[k] /= Math.max(1, nGround);
+  return f as unknown as Features;
 }
 
-
-// ---------------------------------------------------------------------------
-// Guessing: the practice set (75 photos, OpenStreetView-5M test split) cannot
-// be separated into regions from global colour statistics — a decision tree
-// and climate-zone rules both scored WORSE than a single point out of sample
-// (tree 8,087/8,069/10,522 km vs fixed 9,455/6,804/5,619 km per held-out
-// trial), and the "snow" cue fires as often on bright tropical sand as on
-// real snow. So the agent answers the distribution's error-minimising fixed
-// point for every photo, with one override that validated out of sample:
-// heavy dry dirt with almost no vegetation (sandGround > 0.5, veg < 0.05)
-// is an arid photo, and the arid centroid beats the fixed point for those.
-// Fixed point (57.5, 27.5): bootstrap median of the practice-optimal point
-// (lat p10–p90 47.5–65, lon 15–41.2). In-sample mean error 6,844 km fixed,
-// 6,567 km with the arid override; a vision model scores ~474 km on the
-// same photos, so this is far from the ceiling — but it needs no key, never
-// times out, and answers every photo.
-// ---------------------------------------------------------------------------
-
-/** Error-minimising fixed point for the OpenStreetView-5M distribution. */
-const FIXED_POINT = { lat: 57.5, lon: 27.5 };
-/** Centroid of the practice set's arid photos (Atacama, Oman, Brazil interior). */
-const ARID_POINT = { lat: -13.75, lon: -29.5 };
-
-export function guessLocation(f: Features): { lat: number; lon: number } {
-  if (f.sandGround > 0.5 && f.veg < 0.05) return ARID_POINT;
-  return FIXED_POINT;
+function guess(f: Features | null): { lat: number; lon: number } {
+  if (f && f.sandGround > 0.5 && f.veg < 0.05) return ARID;
+  return FIXED;
 }
 
 // ---------------------------------------------------------------------------
-// Trial env client.
+// Trial env protocol
 // ---------------------------------------------------------------------------
 
-import { readFile } from 'node:fs/promises';
-
-function need(name: string): string {
-  const v = process.env[name];
-  if (v === undefined || v === '') throw new Error(`${name} is not set`);
-  return v;
-}
-
-interface Photo {
-  id: string;
-  url: string;
-  answered: boolean;
-}
-
-interface Guess {
-  id: string;
-  lat: number;
-  lon: number;
-}
-
-async function main(): Promise<number> {
-  const envUrl = need('MAKEFUN_ENV_URL').replace(/\/+$/, '');
-  // Read the brief for the record; its content does not change the guesses.
+async function main(): Promise<void> {
   const promptFile = process.env.MAKEFUN_PROMPT_FILE;
   if (promptFile) {
     try {
-      await readFile(promptFile, 'utf8');
+      readFileSync(promptFile, "utf8"); // advisory only
     } catch {
-      // The brief is advisory; a missing file must not stop the run.
+      /* ignore */
     }
   }
-  const listed = (await (await fetch(`${envUrl}/photos`)).json()) as { photos: Photo[] };
-  const photos = listed.photos.filter((p) => !p.answered).sort((a, b) => a.id.localeCompare(b.id));
-  const answers: Guess[] = [];
-  for (const p of photos) {
-    let guess = FIXED_POINT;
+  const base = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
+  if (!base) throw new Error("MAKEFUN_ENV_URL not set");
+
+  const listRes = await fetch(`${base}/photos`);
+  if (!listRes.ok) throw new Error(`GET /photos -> ${listRes.status}`);
+  const list = (await listRes.json()) as { photos: { id: string }[] };
+  const ids = list.photos.map((p) => p.id).sort();
+
+  const answers: { id: string; lat: number; lon: number }[] = [];
+  for (const id of ids) {
+    let g = FIXED;
     try {
-      const res = await fetch(`${envUrl}${p.url}`);
-      if (!res.ok) throw new Error(`GET ${p.url} HTTP ${res.status}`);
-      const jpeg = Buffer.from(await res.arrayBuffer());
-      guess = guessLocation(extractFeatures(decodeJpeg(jpeg, 4)));
-    } catch (err) {
-      process.stderr.write(`geo: ${p.id} decode failed, using fixed point: ${(err as Error).message}\n`);
+      const r = await fetch(`${base}/photos/${id}.jpg`);
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const img = decodeJpeg(new Uint8Array(await r.arrayBuffer()));
+      g = guess(extract(img));
+    } catch (e) {
+      console.error(`photo ${id}: ${(e as Error).message}; using fixed point`);
     }
-    answers.push({ id: p.id, lat: guess.lat, lon: guess.lon });
+    answers.push({ id, lat: g.lat, lon: g.lon });
   }
-  if (answers.length === 0) return 0;
-  const res = await fetch(`${envUrl}/answers`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+
+  const res = await fetch(`${base}/answers`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({ answers }),
   });
-  process.stdout.write(`geo: ${answers.length} of ${photos.length} photos answered: HTTP ${res.status} ${await res.text()}`);
-  return res.ok ? 0 : 1;
+  if (!res.ok) throw new Error(`POST /answers -> ${res.status} ${await res.text()}`);
+  console.log(`answered ${answers.length} photos`);
 }
 
-try {
-  process.exitCode = await main();
-} catch (err) {
-  process.stderr.write(`geo: ${(err as Error).stack ?? String(err)}\n`);
-  process.exitCode = 1;
-}
+main().then(
+  () => process.exit(0),
+  (e) => {
+    console.error(e);
+    process.exit(1);
+  },
+);
